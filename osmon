@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""osmon —— 终端监控大盘（硬件 / 磁盘 / 告警 / 电源）。
+
+用法:
+  osmon                        实时大盘（默认 2s 刷新，Ctrl-C 退出）
+  osmon dash --interval 3      实时大盘，指定刷新间隔
+  osmon dash --once            只打印一屏快照（可管道/重定向）
+  osmon hw                     CPU-Z 风格硬件状态
+  osmon disk                   分区用量 / IO 速率 / SMART
+  osmon disk big --refresh     扫描大文件与长期未访问的“死代码”（默认按目录 mtime 增量）
+  osmon disk big --full        忽略增量指纹，强制全量重扫
+  osmon power                  电池 / AC / 功耗
+  osmon alert                  当前告警与高占用进程
+  osmon watch                  只刷新告警面板
+
+通用选项:
+  --json                       机器可读输出
+  --no-color                   关闭颜色
+  --cpu/--mem/--disk/--temp/--battery/--drain 阈值（也支持环境变量 OSMON_*）
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import psutil  # noqa: E402
+
+from osmon_lib import alerts as alerts_mod  # noqa: E402
+from osmon_lib import diskwatch, hwinfo, power  # noqa: E402
+from osmon_lib.ui import (C, bar, clear_screen, color, fmt_bytes,  # noqa: E402
+                          fmt_rate, kv, panel, set_color, table)
+
+DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ---------------- 各面板渲染 ----------------
+
+def render_header(th) -> str:
+    oi = hwinfo.os_info()
+    cpu = psutil.cpu_percent(interval=0.0)
+    vm = psutil.virtual_memory()
+    return (color(" osmon 监控大盘 ", C.BOLD)
+            + color(f" {time.strftime('%Y-%m-%d %H:%M:%S')} ", C.DIM)
+            + f"  {oi['主机名']} · {oi['系统']} · 内核 {oi['内核']} · 运行 {oi['运行时间']} · "
+            f"负载 {oi['平均负载']} · 进程 {oi['进程数']}\n"
+            + f"  CPU {bar(cpu, 20, th.cpu, 95)} {cpu:5.1f}%   "
+            + f"内存 {bar(vm.percent, 20, th.mem, 95)} {vm.percent:5.1f}%")
+
+
+def render_hw(compact: bool = False) -> str:
+    snap = hwinfo.snapshot()
+    lines = []
+    lines.append(panel("硬件状态", kv(list(snap["cpu"].items()))))
+    lines.append(panel("内存 / 主板", kv(list(snap["memory"].items()) + list(snap["board"].items()))))
+    gpus = "\n".join(f"  · {g}" for g in snap["gpu"])
+    lines.append(panel("显卡 / 系统", gpus + "\n" + kv(list(snap["os"].items()))))
+    if compact:
+        return "\n".join(lines)
+
+    temp_rows = []
+    for chip, items in snap["temps"].items():
+        for label, cur, high, crit in items[:6]:
+            lvl = C.RED if (crit and cur >= crit - 10) or cur >= 85 else (C.YELLOW if cur >= 70 else C.GREEN)
+            temp_rows.append([chip, label, color(f"{cur:.1f} ℃", lvl),
+                              f"{high:.0f}" if high else "—", f"{crit:.0f}" if crit else "—"])
+    if temp_rows:
+        lines.append(panel("温度 / 风扇",
+                           table(["芯片", "传感器", "当前", "high", "crit"], temp_rows,
+                                 aligns=["l", "l", "r", "r", "r"])))
+    if snap["fans"]:
+        lines.append(panel("风扇转速", kv([(f"{chip}/{l}", f"{v:.0f} RPM") for chip, items in snap["fans"].items() for l, v in items])))
+    return "\n".join(lines)
+
+
+def render_disk(th, root: str) -> str:
+    rows = []
+    for p in diskwatch.partitions():
+        rows.append([p["device"], p["mount"], p["fstype"], fmt_bytes(p["total"]),
+                     fmt_bytes(p["used"]), fmt_bytes(p["free"]),
+                     bar(p["percent"], 18, th.disk, 95) + f" {p['percent']:.0f}%"])
+    io = diskwatch.io_rates()
+    head = table(["设备", "挂载点", "类型", "总容量", "已用", "剩余", "使用率"], rows,
+                 aligns=["l", "l", "l", "r", "r", "r", "l"])
+    io_line = f"  IO: 读 {fmt_rate(io['read'])}  写 {fmt_rate(io['write'])}  " \
+              f"(采样间隔内 {io['read_count']}/{io['write_count']} 次)"
+    out = [panel("磁盘分区", head + "\n" + color(io_line, C.DIM))]
+
+    cached = diskwatch.load_cache(root)
+    if cached:
+        age_h = (time.time() - cached.get("scanned_at", 0)) / 3600
+        big = panel("大文件 / 死代码预警（缓存快照）", "\n".join([
+            f"  根目录: {cached['root']}   （快照 {age_h:.1f} 小时前，刷新: osmon disk big --refresh）",
+            f"  大文件(≥{fmt_bytes(cached['min_size'])}): {cached['big_count']:,} 个 / "
+            f"{color(fmt_bytes(cached['big_bytes']), C.BOLD)}",
+            f"  其中 {cached['idle_days']:.0f} 天未访问: "
+            + color(f"{cached['cold_count']:,} 个 / {fmt_bytes(cached['cold_bytes'])}", C.YELLOW),
+        ]))
+        out.append(big)
+    else:
+        out.append(panel("大文件 / 死代码预警",
+                         color(f"  尚无缓存，执行一次扫描即可：osmon disk big --path {root} --refresh", C.YELLOW)))
+    return "\n".join(out)
+
+
+def render_power(tdp: float) -> str:
+    return panel("电源 / 耗电", power.render(power.snapshot(tdp)))
+
+
+def render_alerts(th) -> str:
+    return panel("告警", alerts_mod.render(alerts_mod.collect(th), th))
+
+
+def render_procs(th) -> str:
+    rows = []
+    for p in alerts_mod.top_processes(6, "cpu"):
+        rows.append([str(p["pid"]), (p["name"] or "")[:28], f"{p['cpu_percent']:.1f}",
+                     f"{p['memory_percent']:.2f}", (p.get("username") or "")[:12]])
+    if not rows:
+        return panel("高占用进程", color("  正在采样，下一屏刷新后显示（或当前无进程超过阈值）", C.DIM))
+    return panel("高占用进程 (Top CPU)",
+                 table(["PID", "进程名", "CPU%", "内存%", "用户"], rows,
+                       aligns=["r", "l", "r", "r", "l"])) 
+
+
+def render_dashboard(th, root, tdp) -> str:
+    return "\n".join([
+        render_header(th),
+        render_disk(th, root),
+        render_procs(th),
+        render_power(tdp),
+        render_alerts(th),
+        color("  Ctrl-C 退出；单屏快照: osmon dash --once；硬件详情: osmon hw", C.DIM),
+    ])
+
+
+# ---------------- 命令实现 ----------------
+
+def prime() -> None:
+    """建立采样基线（进程 CPU / 磁盘 IO），随后 sleep 一小段即可得到真实速率。"""
+    alerts_mod.prime_processes()
+    diskwatch.io_rates()
+
+
+def cmd_dash(args, th):
+    if args.json or args.once:
+        prime()
+        time.sleep(0.6)
+        print(render_dashboard(th, args.root, args.tdp))
+        if args.json:
+            print(json.dumps(snapshot_json(th, args.root, args.tdp), ensure_ascii=False, indent=2))
+        return
+    prime()
+    try:
+        while True:
+            clear_screen()
+            print(render_dashboard(th, args.root, args.tdp))
+            sys.stdout.flush()
+            time.sleep(max(0.5, args.interval))
+    except KeyboardInterrupt:
+        print("\n已退出。")
+
+
+def cmd_hw(args, th):
+    if args.json:
+        print(json.dumps(hwinfo.snapshot(), ensure_ascii=False, indent=2))
+    else:
+        print(render_hw(compact=args.compact))
+
+
+def cmd_disk(args, th):
+    if args.json:
+        print(json.dumps({"partitions": diskwatch.partitions(), "io": diskwatch.io_rates(),
+                          "devices": diskwatch.devices(),
+                          "smart": [diskwatch.smart_health(d["path"]) for d in diskwatch.devices()]},
+                         ensure_ascii=False, indent=2))
+        return
+    print(render_disk(th, args.root))
+    if args.smart:
+        rows = []
+        for d in diskwatch.devices():
+            s = diskwatch.smart_health(d["path"])
+            state = ("通过" if s["ok"] else ("失败" if s["ok"] is False else "未知"))
+            rows.append([d["path"], d["size"], d["model"][:28] or "—", state,
+                         f"{s['temp']:.0f}℃" if s.get("temp") else "—", s["detail"][:40]])
+        print(panel("SMART 健康", table(["设备", "容量", "型号", "健康", "温度", "详情"], rows,
+                                        aligns=["l", "r", "l", "l", "r", "l"])))
+
+
+def cmd_disk_big(args, th):
+    root = args.path or args.root
+    min_size = parse_size(args.min_size)
+    if args.json and not args.refresh:
+        cached = diskwatch.load_cache(root)
+        print(json.dumps(cached or {"error": "无缓存，加 --refresh 先扫描"}, ensure_ascii=False, indent=2))
+        return
+    if args.refresh:
+        print(f"扫描 {root}（≥{fmt_bytes(min_size)}，{args.idle_days:.0f} 天未访问记为死代码）…", file=sys.stderr)
+        t0 = time.time()
+        data = diskwatch.scan_big_files(root, min_size, args.idle_days, args.top,
+                                        max_depth=args.max_depth, verbose=not args.json,
+                                        incremental=not args.full, ttl_days=args.cache_ttl)
+        saved = diskwatch.save_cache(root, data)
+        dt = time.time() - t0
+        reused = data.get("reused_dirs") or 0
+        print(f"扫描完成，用时 {dt:.1f}s"
+              + (f"（增量：复用 {reused:,} 个目录，跳过 {data.get('skipped_stats', 0):,} 次 stat）"
+                 if reused else "（全量重扫）")
+              + f"，缓存写入 {saved}", file=sys.stderr)
+        if args.json:
+            # dirmap 是扫描索引，不属于结果数据
+            data.pop("dirmap", None)
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            return
+        print(panel("大文件 / 死代码预警", diskwatch.render_big_files(data, args.top, only_cold=args.cold)))
+        return
+    data = diskwatch.load_cache(root)
+    if args.json:
+        print(json.dumps(data or {"error": "无缓存，加 --refresh 先扫描"}, ensure_ascii=False, indent=2))
+    else:
+        print(panel("大文件 / 死代码预警（缓存快照）",
+                    diskwatch.render_big_files(data, args.top, only_cold=args.cold)))
+
+
+def cmd_power(args, th):
+    info = power.snapshot(args.tdp)
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+    else:
+        print(render_power(args.tdp))
+
+
+def cmd_alert(args, th):
+    prime()
+    time.sleep(0.5)
+    if args.json:
+        print(json.dumps({"alerts": [{"level": a[0], "source": a[1], "msg": a[2]}
+                                     for a in alerts_mod.collect(th)],
+                          "thresholds": alerts_mod.as_dict(th),
+                          "top_cpu": alerts_mod.top_processes(args.top, "cpu"),
+                          "top_mem": alerts_mod.top_processes(args.top, "mem")},
+                         ensure_ascii=False, indent=2))
+        return
+    print(render_alerts(th))
+    rows = []
+    for p in alerts_mod.top_processes(args.top, "cpu"):
+        rows.append([str(p["pid"]), (p["name"] or "")[:30], f"{p['cpu_percent']:.1f}",
+                     f"{p['memory_percent']:.2f}"])
+    print(panel("Top CPU 进程", table(["PID", "进程名", "CPU%", "内存%"], rows,
+                                      aligns=["r", "l", "r", "r"])))
+    rows = []
+    for p in alerts_mod.top_processes(args.top, "mem"):
+        rows.append([str(p["pid"]), (p["name"] or "")[:30], f"{p['memory_percent']:.2f}",
+                     f"{p['cpu_percent']:.1f}"])
+    print(panel("Top 内存进程", table(["PID", "进程名", "内存%", "CPU%"], rows,
+                                      aligns=["r", "l", "r", "r"])))
+
+
+def cmd_watch(args, th):
+    try:
+        while True:
+            clear_screen()
+            print(render_header(th))
+            print(render_alerts(th))
+            print(render_procs(th))
+            sys.stdout.flush()
+            time.sleep(max(0.5, args.interval))
+    except KeyboardInterrupt:
+        print("\n已退出。")
+
+
+def snapshot_json(th, root, tdp) -> dict:
+    return {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "cpu_percent": psutil.cpu_percent(interval=0.0),
+        "per_cpu": psutil.cpu_percent(interval=0.0, percpu=True),
+        "memory": dict(psutil.virtual_memory()._asdict()),
+        "swap": dict(psutil.swap_memory()._asdict()),
+        "partitions": diskwatch.partitions(),
+        "power": power.snapshot(tdp),
+        "alerts": [{"level": a[0], "source": a[1], "msg": a[2]} for a in alerts_mod.collect(th)],
+        "thresholds": alerts_mod.as_dict(th),
+    }
+
+
+def parse_size(text: str) -> int:
+    units = {"B": 1, "K": 1024, "KB": 1024, "M": 1024**2, "MB": 1024**2,
+             "G": 1024**3, "GB": 1024**3, "T": 1024**4, "TB": 1024**4}
+    text = text.strip().upper().replace("IB", "B")
+    for suffix in ("TB", "GB", "MB", "KB", "B", "T", "G", "M", "K"):
+        if text.endswith(suffix):
+            num = text[: -len(suffix)].strip()
+            try:
+                return int(float(num) * units[suffix])
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"无法解析大小: {text}")
+    try:
+        return int(float(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"无法解析大小: {text}")
+
+
+# ---------------- CLI ----------------
+
+def _common() -> argparse.ArgumentParser:
+    """通用参数：放在子命令前后都生效（SUPPRESS 避免子命令覆盖主解析结果）。"""
+    c = argparse.ArgumentParser(add_help=False)
+    c.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="机器可读输出")
+    c.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="关闭颜色")
+    c.add_argument("--root", default=argparse.SUPPRESS, help=f"大文件扫描根目录（默认 {DEFAULT_ROOT}）")
+    c.add_argument("--tdp", type=float, default=argparse.SUPPRESS, help="CPU TDP(W)，RAPL不可读时估算功耗，默认 15")
+    for flag, helptext in (
+        ("--cpu", "CPU 使用率告警阈值 %%"),
+        ("--mem", "内存使用率告警阈值 %%"),
+        ("--disk", "磁盘使用率告警阈值 %%"),
+        ("--temp", "温度告警阈值 ℃"),
+        ("--battery", "电量下限告警阈值 %%"),
+        ("--drain", "放电功率告警阈值 W"),
+        ("--proc-cpu", "单进程 CPU 告警阈值 %%"),
+        ("--proc-mem", "单进程内存告警阈值 %%"),
+    ):
+        c.add_argument(flag, type=float, default=argparse.SUPPRESS, help=helptext)
+    return c
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = _common()
+    p = argparse.ArgumentParser(prog="osmon", description="终端监控大盘：硬件 / 磁盘 / 告警 / 电源",
+                                parents=[common])
+    sub = p.add_subparsers(dest="cmd")
+
+    d = sub.add_parser("dash", help="实时监控大盘（默认命令）", parents=[common])
+    d.add_argument("--interval", type=float, default=2.0)
+    d.add_argument("--once", action="store_true", help="只输出一屏")
+
+    h = sub.add_parser("hw", help="CPU-Z 风格硬件状态", parents=[common])
+    h.add_argument("--compact", action="store_true", help="不显示温度/风扇")
+
+    dk = sub.add_parser("disk", help="磁盘分区 / IO / SMART", parents=[common])
+    dk.add_argument("--smart", action="store_true", help="同时查询 SMART 健康")
+
+    bg = sub.add_parser("disk-big", aliases=["big"], help="大文件占用与死代码预警", parents=[common])
+    bg.add_argument("--path", default=None, help="扫描根目录（默认 --root）")
+    bg.add_argument("--min-size", default="500MB", help="大文件阈值，默认 500MB")
+    bg.add_argument("--idle-days", type=float, default=365, help="多少天未访问算死代码，默认 365")
+    bg.add_argument("--top", type=int, default=25, help="展示条数")
+    bg.add_argument("--max-depth", type=int, default=0, help="扫描目录深度上限，0=不限")
+    bg.add_argument("--cold", action="store_true", help="只展示长期未访问的文件")
+    bg.add_argument("--refresh", action="store_true", help="重新扫描并写入缓存（默认按目录 mtime 增量）")
+    bg.add_argument("--full", action="store_true", help="忽略目录指纹，强制全量重扫")
+    bg.add_argument("--cache-ttl", type=float, default=14.0,
+                    help="目录指纹有效期(天)，超过则强制重扫该目录，默认 14")
+
+    sub.add_parser("power", help="电池 / AC / 功耗", parents=[common])
+    al = sub.add_parser("alert", help="当前告警与高占用进程", parents=[common])
+    al.add_argument("--top", type=int, default=8)
+    wt = sub.add_parser("watch", help="只刷新告警面板", parents=[common])
+    wt.add_argument("--interval", type=float, default=2.0)
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+    if argv[:2] == ["disk", "big"]:  # 兼容 osmon disk big
+        argv = ["big"] + argv[2:]
+    args = parser.parse_args(argv)
+    g = lambda k, d=None: getattr(args, k, d)  # noqa: E731  全局参数可能在子命令里给出
+    args.json = bool(g("json", False))
+    args.root = g("root") or os.environ.get("OSMON_SCAN_ROOT", DEFAULT_ROOT)
+    args.tdp = float(g("tdp") or os.environ.get("OSMON_TDP", 15) or 15)
+    if g("no_color") or g("json"):
+        set_color(False)
+    th = alerts_mod.Thresholds.from_env().update(
+        cpu=g("cpu"), mem=g("mem"), disk=g("disk"), temp=g("temp"),
+        battery=g("battery"), drain_watts=g("drain"),
+        proc_cpu=g("proc_cpu"), proc_mem=g("proc_mem"))
+
+    cmd = args.cmd or "dash"
+    if cmd in ("dash",):
+        if not hasattr(args, "interval"):
+            args.interval = 2.0
+            args.once = False
+        cmd_dash(args, th)
+    elif cmd == "hw":
+        cmd_hw(args, th)
+    elif cmd == "disk":
+        cmd_disk(args, th)
+    elif cmd in ("disk-big", "big"):
+        cmd_disk_big(args, th)
+    elif cmd == "power":
+        cmd_power(args, th)
+    elif cmd == "alert":
+        if not hasattr(args, "top"):
+            args.top = 8
+        cmd_alert(args, th)
+    elif cmd == "watch":
+        if not hasattr(args, "interval"):
+            args.interval = 2.0
+        cmd_watch(args, th)
+    else:
+        parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
